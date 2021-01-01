@@ -67,9 +67,9 @@ decl_module! {
         #[weight = 0]
         fn spend(_origin, transaction: Transaction) -> DispatchResult {
             // 1. TODO: check that transaction is valid
+            let reward = Self::validate_transaction(&transaction)?;
             
             // 2. write to storage
-            let reward: Value = 0;
             Self::update_storage(&transaction, reward)?;
 
             // 3. emit success event
@@ -96,6 +96,64 @@ decl_event! {
 }
 
 impl<T: Trait> Module<T> {
+    // transaction with sigscript removed
+    pub fn get_simple_transaction(transaction: &Transaction) -> Vec<u8> {
+        let mut trx = transaction.clone();
+
+        for input in trx.inputs.iter_mut() {
+            input.sigscript = H512::zero();
+        }
+        trx.encode()
+    }
+
+    fn validate_transaction(transaction: &Transaction) -> Result<Value, &'static str> {
+        ensure!(!transaction.inputs.is_empty(), "No inputs");
+        ensure!(!transaction.outputs.is_empty(), "No outputs");
+
+        {
+            let input_set: BTreeMap<_, ()> = transaction.inputs.iter().map(|input| (input, ())).collect();
+            ensure!(!input_set.len() == transaction.inputs.len(), "Error: duplicate inputs");
+        }
+
+        {
+            let output_set: BTreeMap<_, ()> = transaction.outputs.iter().map(|output| (output, ())).collect();
+            ensure!(!output_set.len() == transaction.outputs.len(), "Error: duplicate outputs");
+        }
+
+        let simple_trx = Self::get_simple_transaction(transaction);
+
+        let mut total_input: Value = 0;
+        let mut total_output: Value = 0;
+
+        for input in transaction.inputs.iter() {
+            if let Some(input_utxo) = UtxoStore::get(&input.outpoint) {
+                ensure!( sp_io::crypto::sr25519_verify(
+                    &Signature::from_raw(*input.sigscript.as_fixed_bytes()),
+                    &simple_trx,
+                    &Public::from_h256(input_utxo.pubkey)
+                ),"Invalid signature");
+                total_input = total_input.checked_add(input_utxo.value).ok_or("total input overflowed")?;
+            } else {
+                //TODO: hanlde race condition
+            }
+        }
+
+        let mut output_index: u64 = 0;
+        for output in transaction.outputs.iter() {
+            ensure!(output.value > 0, "Output value should be nonzero");
+            let hash = BlakeTwo256::hash_of(&(&transaction.encode(), output_index));
+            output_index = output_index.checked_add(1).ok_or("Output index overflowed")?;
+            ensure!(!UtxoStore::contains_key(hash), "Output already exists");
+            total_output = total_output.checked_add(output.value).ok_or("total output overflowed")?;
+        }
+
+        ensure!(total_input >= total_output, "Output value exceeded input");
+
+        let reward = total_input - total_output;
+
+        Ok(reward)
+    }
+
     fn update_storage(transaction: &Transaction, reward: Value) -> DispatchResult {
         let new_reward_total = RewardTotal::get()
             .checked_add(reward)
